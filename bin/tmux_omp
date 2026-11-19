@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# tmux_omp — meniu mic pentru sesiuni omp în tmux
+#
+# Rulezi `tmux_omp` și alegi cu săgețile:
+#   + Sesiune nouă aici    pornește omp în folderul curent, într-o sesiune tmux
+#   Sesiuni tmux           toate sesiunile tmux ale tale (cu folderul și conversația lor)
+#   Oprite                 sesiuni care rulau înainte (ex. înainte de restart PC):
+#                          - dacă știe conversația, o repornește direct
+#                          - altfel îți arată conversațiile din folderul ei (pasul 2)
+#   Conversații            conversațiile omp din folderul curent -> le reia în tmux
+#
+# Taste: ↑/↓ (sau j/k) navighezi · Enter alegi · x închizi/ștergi · q ieși/înapoi
+#
+# Istoricul e în ~/.omp-tmux-sessions: nume tmux, folder, id conversație, data.
+# Orice sesiune tmux văzută de tmux_omp e salvată acolo cu folderul ei.
+#
+# `tmux_omp restart` repornește fără meniu sesiunile oprite cu conversație cunoscută
+# (poți pune în crontab: @reboot /cale/tmux_omp restart)
+
+REG="${OMP_TMUX_SESSIONS_FILE:-$HOME/.omp-tmux-sessions}"
+OMP_BIN="${OMP_BIN:-omp}"
+OMP_SESSIONS_DIR="${OMP_SESSIONS_DIR:-$HOME/.omp/agent/sessions}"
+MAX_CONV="${OMP_TMUX_MAX_CONV:-10}"
+
+# diacriticele au nevoie de UTF-8 ca să se taie corect rândurile
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]*) ;; *) export LC_CTYPE=C.UTF-8 ;; esac
+
+die() { echo "Eroare: $*" >&2; exit 1; }
+case "${1:-}" in
+  -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+command -v tmux >/dev/null 2>&1 || die "tmux nu e instalat"
+command -v "$OMP_BIN" >/dev/null 2>&1 || die "'$OMP_BIN' nu e în PATH"
+command -v python3 >/dev/null 2>&1 || die "python3 nu e instalat"
+[[ "$MAX_CONV" =~ ^[1-9][0-9]*$ ]] || die "OMP_TMUX_MAX_CONV trebuie să fie un număr pozitiv"
+touch "$REG" || die "Nu pot scrie istoricul '$REG'"
+CATALOG=$(mktemp) || die "Nu pot crea catalogul temporar"
+trap 'rm -f "$CATALOG"; tput cnorm 2>/dev/null || true' EXIT
+
+# ---------------- utilitare ----------------
+
+running() { tmux has-session -t "=$1" 2>/dev/null </dev/null; }
+short()   { echo "${1/#$HOME/~}"; }
+safe()    { local n="$1"; echo "${n//[.: ]/_}"; }          # tmux nu acceptă . : în nume
+# Catalogul conversațiilor omp: fiecare fișier *.jsonl de sub OMP_SESSIONS_DIR
+# are un record "session" cu id, cwd, titlu și timestamp. Citim doar ce ne trebuie
+# pentru meniu; nu modificăm sesiunile omp.
+load_catalog() {
+  python3 - "$OMP_SESSIONS_DIR" "$CATALOG" <<'EOF'
+import json, sys
+from pathlib import Path
+root, target = Path(sys.argv[1]), Path(sys.argv[2])
+rows = []
+if root.is_dir():
+    for path in root.rglob('*.jsonl'):
+        try:
+            meta, title, first_user = None, None, None
+            with path.open(errors='replace') as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    t = event.get('type')
+                    if t == 'title' and title is None:
+                        title = (event.get('title') or '').strip() or None
+                    elif t == 'session' and meta is None and event.get('id') and event.get('cwd'):
+                        meta = event
+                        if not title:
+                            title = (meta.get('title') or '').strip() or None
+                    elif t == 'message' and first_user is None:
+                        m = event.get('message') or {}
+                        if m.get('role') == 'user':
+                            c = m.get('content')
+                            if isinstance(c, list):
+                                c = ' '.join(x.get('text', '') for x in c
+                                              if isinstance(x, dict) and x.get('type') == 'text')
+                            if isinstance(c, str) and c.strip() and not c.lstrip().startswith('<'):
+                                first_user = c.strip().splitlines()[0]
+                    if meta is not None and (title or first_user):
+                        break
+            if meta:
+                rows.append(dict(id=meta['id'], cwd=meta['cwd'],
+                                 title=title or first_user or '',
+                                 updated=path.stat().st_mtime))
+        except (OSError, ValueError, TypeError):
+            continue
+with target.open('w') as stream:
+    json.dump(sorted(rows, key=lambda r: r['updated'], reverse=True), stream)
+EOF
+}
+
+preview() {  # titlul conversației
+  python3 - "$CATALOG" "$1" <<'EOF'
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row['id'] == sys.argv[2]:
+        print(' '.join(row['title'].split())[:70])
+        break
+EOF
+}
+
+attach() {
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$1"; else tmux attach-session -t "=$1"; fi
+}
+
+launch() {  # nume folder id new|resume
+  local name="$1" dir="$2" sid="$3" cmd
+  [ -d "$dir" ] || { echo "Folderul '$dir' nu mai există." >&2; return 1; }
+  printf -v cmd '%q' "$OMP_BIN"
+  if [ "$4" != new ]; then
+    local quoted_sid
+    printf -v quoted_sid '%q' "$sid"
+    cmd+=" --resume $quoted_sid"
+  fi
+  # După ce iese omp, sesiunea rămâne deschisă cu un shell.
+  # Forțăm bash pentru ca escaping-ul %q să fie interpretat corect.
+  local runner
+  printf -v runner '%q -lc %q' "${BASH}" "$cmd; exec \${SHELL:-bash}"
+  tmux new-session -d -s "$name" -c "$dir" "$runner"
+}
+
+# ---------------- istoricul ----------------
+
+reg_get() { awk -F'\t' -v n="$1" '$1 == n {print; exit}' "$REG"; }
+reg_del() {
+  local tmp; tmp=$(mktemp)
+  awk -F'\t' -v n="$1" '$1 != n && $1 != ""' "$REG" > "$tmp" && mv "$tmp" "$REG"
+}
+reg_set() {  # nume folder id — adaugă sau înlocuiește
+  reg_del "$1"
+  # "-" = conversație necunoscută (un câmp gol s-ar pierde la citire)
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "${3:--}" "$(date '+%Y-%m-%d %H:%M')" >> "$REG"
+}
+reg_touch() {  # nume folder — adaugă doar dacă lipsește (sesiuni pornite manual)
+  [ -n "$(reg_get "$1")" ] || reg_set "$1" "$2" ""
+}
+
+# ---------------- acțiuni ----------------
+
+new_session() {  # folder
+  local def name sid
+  def=$(safe "omp-$(basename "$1")-$(date +%H%M%S)")
+  read -rp "Nume sesiune [$def]: " name
+  name=$(safe "${name:-$def}")
+  if ! running "$name"; then
+    sid=""
+    launch "$name" "$1" "$sid" new || exit 1
+    reg_set "$name" "$1" "$sid"
+  fi
+  attach "$name"
+}
+
+open_conv() {  # nume folder id — pornește conversația în sesiunea dată și atașează
+  if ! running "$1"; then
+    launch "$1" "$2" "$3" resume || exit 1
+    reg_set "$1" "$2" "$3"
+  fi
+  attach "$1"
+}
+
+restart_all() {
+  local n d s _ k=0 skip=0
+  while IFS=$'\t' read -r n d s _; do
+    { [ -z "$n" ] || running "$n"; } && continue
+    [ "$s" = - ] && s=
+    if [ -z "$s" ]; then skip=$((skip + 1)); continue; fi
+    launch "$n" "$d" "$s" resume </dev/null && { echo "Repornită: $n"; k=$((k + 1)); }
+  done < "$REG"
+  echo "$k sesiuni repornite."
+  [ "$skip" -gt 0 ] && echo "$skip sesiuni fără conversație cunoscută — alege-le din meniu (tmux_omp)."
+  return 0
+}
+
+# ---------------- elementele meniului ----------------
+# L = text, A = tip, N = nume sesiune, D = folder, S = id conversație
+# tipuri: new | tmux | stopped | conv | subnew | subconv | head
+
+item() { L+=("$1"); A+=("$2"); N+=("$3"); D+=("$4"); S+=("$5"); }
+reset_items() { L=(); A=(); N=(); D=(); S=(); }
+
+add_convs() {  # folder tip nume-sesiune ascunde-cele-din-istoric(1/0) titlu
+  local dir="$1" kind="$2" name="$3" hide="$4" title="$5" id lbl stamp k=0 head=
+  while IFS=$'\t' read -r id stamp lbl; do
+    [ "$hide" = 1 ] && awk -F'\t' -v id="$id" '$3 == id {found=1} END {exit !found}' "$REG" && continue
+    [ -z "$head" ] && [ -n "$title" ] && { item "$title" head; head=1; }
+    item "$stamp   ${lbl:-(fără text)}" "$kind" "$name" "$dir" "$id"
+    k=$((k + 1)); [ "$k" -ge "$MAX_CONV" ] && break
+  done < <(python3 - "$CATALOG" "$dir" <<'EOF'
+import json, os, sys
+from datetime import datetime
+for row in json.load(open(sys.argv[1])):
+    if os.path.realpath(row['cwd']) != os.path.realpath(sys.argv[2]):
+        continue
+    stamp = datetime.fromtimestamp(row['updated']).strftime('%d.%m %H:%M')
+    label = ' '.join(row['title'].split())[:70] or '(fără text)'
+    print(f"{row['id']}\t{stamp}\t{label}")
+EOF
+  )
+}
+
+build_main() {
+  load_catalog || die "Nu pot citi istoricul omp"
+  reset_items
+  local n d s _ path cmd att lbl rec head
+  TITLE="omp  $(short "$PWD")"
+
+  item "+ Sesiune nouă aici" new "" "$PWD"
+
+  head=
+  while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    [ -z "$head" ] && { item "Sesiuni tmux" head; head=1; }
+    path=$(tmux display-message -p -t "=$n:" '#{session_path}' 2>/dev/null </dev/null)
+    cmd=$(tmux display-message -p -t "=$n:" '#{pane_current_command}' 2>/dev/null </dev/null)
+    att=$(tmux display-message -p -t "=$n:" '#{session_attached}' 2>/dev/null </dev/null)
+    reg_touch "$n" "$path"                         # ține minte sesiunea și folderul ei
+    IFS=$'\t' read -r _ d s _ <<< "$(reg_get "$n")"; [ "$s" = - ] && s=
+    lbl="$n   $(short "$path")"
+    if [ -n "$s" ]; then lbl+="   · $(preview "$s")"
+    elif [[ "$cmd" == omp* || "$cmd" == node* || "$cmd" == bun* ]]; then lbl+="   · omp"
+    fi
+    [ "${att:-0}" -gt 0 ] && lbl+="   ●"
+    item "$lbl" tmux "$n" "$path" "$s"
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+  head=
+  while IFS=$'\t' read -r n d s _; do
+    { [ -z "$n" ] || running "$n"; } && continue
+    [ "$s" = - ] && s=
+    [ -z "$head" ] && { item "Oprite (Enter = repornește)" head; head=1; }
+    lbl="$n   $(short "$d")"
+    if [ -n "$s" ]; then rec=$(preview "$s"); lbl+="   · ${rec:-conversație salvată}"
+    else lbl+="   · alegi conversația →"
+    fi
+    item "$lbl" stopped "$n" "$d" "$s"
+  done < "$REG"
+
+  add_convs "$PWD" conv "" 1 "Conversații în acest folder"
+}
+
+build_sub() {  # nume folder — pasul 2: ce pornesc în sesiunea oprită
+  reset_items
+  TITLE="$1  $(short "$2")  — alege conversația"
+  item "+ Conversație nouă" subnew "$1" "$2"
+  add_convs "$2" subconv "$1" 0 "Conversații în folder"
+}
+
+# ---------------- meniul cu săgeți ----------------
+
+DRAWN=0
+if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then ESC_T=0.05; else ESC_T=1; fi
+
+erase() { [ "$DRAWN" -gt 0 ] && printf '\e[%dA\e[J' "$DRAWN"; DRAWN=0; }
+out()   { printf '\r\e[K%s\n' "$1"; DRAWN=$((DRAWN + 1)); }
+
+draw() {
+  local cols i t w
+  cols=$(tput cols 2>/dev/null || echo 80); w=$((cols - 5))
+  erase
+  out "$(printf '\e[1m%s\e[0m' "${TITLE:0:$w}")"
+  for ((i = 0; i < ${#L[@]}; i++)); do
+    t=${L[$i]}; t=${t:0:$w}
+    if [ "${A[$i]}" = head ]; then
+      out ""; out "$(printf '  \e[2m%s\e[0m' "$t")"
+    elif [ "$i" -eq "$CUR" ]; then
+      out "$(printf '\e[36;1m ❯ %s\e[0m' "$t")"
+    else
+      out "   $t"
+    fi
+  done
+  out ""
+  out "$(printf '\e[2m↑↓ navighează · Enter alege · x închide/șterge · q ieșire/înapoi\e[0m')"
+}
+
+step() {  # mută cursorul, sărind peste titluri
+  local i=$CUR
+  while :; do
+    i=$((i + $1))
+    { [ "$i" -lt 0 ] || [ "$i" -ge "${#L[@]}" ]; } && return
+    [ "${A[$i]}" != head ] && { CUR=$i; return; }
+  done
+}
+
+menu() {  # setează CUR și KEY_ACT (enter|x); întoarce 1 la q/Esc
+  local key rest
+  [ "$CUR" -ge "${#L[@]}" ] && CUR=0
+  tput civis 2>/dev/null
+  while :; do
+    draw
+    IFS= read -rsn1 key || { erase; tput cnorm 2>/dev/null; return 1; }
+    if [ "$key" = $'\e' ]; then read -rsn2 -t "$ESC_T" rest; key+="$rest"; fi
+    case "$key" in
+      $'\e[A'|$'\eOA'|k) step -1 ;;
+      $'\e[B'|$'\eOB'|j) step 1 ;;
+      '')                KEY_ACT=enter; break ;;
+      x|X)               KEY_ACT=x; break ;;
+      q|Q|$'\e')         erase; tput cnorm 2>/dev/null; return 1 ;;
+    esac
+  done
+  erase; tput cnorm 2>/dev/null
+  return 0
+}
+
+# pasul 2 pentru o sesiune oprită fără conversație cunoscută
+sub_menu() {  # nume folder
+  local sid
+  CUR=0
+  build_sub "$1" "$2"
+  while menu; do
+    [ "$KEY_ACT" = enter ] || continue
+    case "${A[$CUR]}" in
+      subnew)  sid=""; launch "$1" "$2" "$sid" new || exit 1
+               reg_set "$1" "$2" "$sid"; attach "$1"; exit ;;
+      subconv) open_conv "$1" "$2" "${S[$CUR]}"; exit ;;
+    esac
+  done
+  return 1   # înapoi la meniul principal
+}
+
+main() {
+  local ok
+  CUR=0
+  while :; do
+    build_main
+    menu || exit 0
+    local i=$CUR
+
+    if [ "$KEY_ACT" = x ]; then
+      case "${A[$i]}" in
+        tmux)
+          read -rp "Închid sesiunea tmux '${N[$i]}'? [d/N] " ok
+          case "$ok" in d|D|y|Y) tmux kill-session -t "=${N[$i]}"; reg_del "${N[$i]}" ;; esac ;;
+        stopped)
+          reg_del "${N[$i]}" ;;   # conversația rămâne în folderul ei
+      esac
+      continue
+    fi
+
+    case "${A[$i]}" in
+      new)     new_session "$PWD"; exit ;;
+      tmux)    attach "${N[$i]}"; exit ;;
+      conv)    open_conv "$(safe "omp-$(basename "$PWD")-${S[$i]:0:8}")" "$PWD" "${S[$i]}"; exit ;;
+      stopped)
+        if [ -n "${S[$i]}" ]; then open_conv "${N[$i]}" "${D[$i]}" "${S[$i]}"; exit; fi
+        sub_menu "${N[$i]}" "${D[$i]}"
+        CUR=0 ;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  restart)   restart_all ;;
+  -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)         main ;;
+esac
