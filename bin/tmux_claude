@@ -13,9 +13,6 @@
 #
 # Istoricul e în ~/.claude-tmux-sessions: nume tmux, folder, id conversație, data.
 # Orice sesiune tmux văzută de cc e salvată acolo cu folderul ei.
-#
-# `cc restart` repornește fără meniu sesiunile oprite cu conversație cunoscută
-# (poți pune în crontab: @reboot /cale/cc restart)
 
 REG="${CC_SESSIONS_FILE:-$HOME/.claude-tmux-sessions}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
@@ -117,18 +114,6 @@ open_conv() {  # nume folder id — pornește conversația în sesiunea dată ș
     reg_set "$1" "$2" "$3"
   fi
   attach "$1"
-}
-
-restart_all() {
-  local n d s _ k=0 skip=0
-  while IFS=$'\t' read -r n d s _; do
-    { [ -z "$n" ] || running "$n"; } && continue
-    [ "$s" = - ] && s=
-    if [ -z "$s" ]; then skip=$((skip + 1)); continue; fi
-    launch "$n" "$d" "$s" resume </dev/null && { echo "Repornită: $n"; k=$((k + 1)); }
-  done < "$REG"
-  echo "$k sesiuni repornite."
-  [ "$skip" -gt 0 ] && echo "$skip sesiuni fără conversație cunoscută — alege-le din meniu (cc)."
 }
 
 # ---------------- elementele meniului ----------------
@@ -304,8 +289,7 @@ main() {
 }
 
 case "${1:-}" in
-  restart)   restart_all ;;
-  -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)         main ;;
 esac
 
