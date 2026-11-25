@@ -3,7 +3,7 @@
 #
 # Rulezi `cc` și alegi cu săgețile:
 #   + Sesiune nouă aici    pornește claude în folderul curent, într-o sesiune tmux
-#   Sesiuni tmux           toate sesiunile tmux ale tale (cu folderul și conversația lor)
+#   Sesiuni tmux           doar sesiunile claude (cu folderul și conversația lor)
 #   Oprite                 sesiuni care rulau înainte (ex. înainte de restart PC):
 #                          - dacă știe conversația, o repornește direct
 #                          - altfel îți arată conversațiile din folderul ei (pasul 2)
@@ -12,7 +12,7 @@
 # Taste: ↑/↓ (sau j/k) navighezi · Enter alegi · x închizi/ștergi · q ieși/înapoi
 #
 # Istoricul e în ~/.claude-tmux-sessions: nume tmux, folder, id conversație, data.
-# Orice sesiune tmux văzută de cc e salvată acolo cu folderul ei.
+# Doar sesiunile claude sunt păstrate în istoric.
 
 REG="${CC_SESSIONS_FILE:-$HOME/.claude-tmux-sessions}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
@@ -32,6 +32,74 @@ touch "$REG"
 running() { tmux has-session -t "=$1" 2>/dev/null </dev/null; }
 short()   { echo "${1/#$HOME/~}"; }
 safe()    { local n="$1"; echo "${n//[.: ]/_}"; }          # tmux nu acceptă . : în nume
+# Marcajul explicit are prioritate față de nume și istoricul vechi.
+mark_ours() { tmux set-option -t "=$1:" @agent claude 2>/dev/null </dev/null; }
+legacy_ours() {
+  local sid owner
+  IFS=$'\t' read -r _ _ sid _ owner <<< "$(reg_get "$1")"
+  [ -n "$owner" ] && { [ "$owner" = claude ]; return; }
+  case "$1" in
+    cc-*|claude-*) return 0 ;;
+    cc-*|claude-*|codex-*|omp-*|agy-*|vibe-*) return 1 ;;
+  esac
+  [ -n "$sid" ] && [ "$sid" != - ]
+}
+session_ours() {
+  local owner pid line t1 t2
+  owner=$(tmux show-option -v -t "=$1:" @agent 2>/dev/null </dev/null)
+  [ -n "$owner" ] && { [ "$owner" = claude ]; return; }
+  if legacy_ours "$1"; then mark_ours "$1"; return 0; fi
+  pid=$(tmux display-message -p -t "=$1:" '#{pane_pid}' 2>/dev/null </dev/null)
+  [ -n "$pid" ] || return 1
+  # Identifică executabilul agentului, inclusiv când este pornit prin node/bash.
+  # Nu consideră procesele node/python ca agenți fără numele executabilului.
+  while IFS= read -r line; do
+    read -r t1 t2 _ <<< "$line"
+    case "$t1" in
+      "$CLAUDE_BIN"|*/"${CLAUDE_BIN##*/}") mark_ours "$1"; return 0 ;;
+      sh|*/sh|bash|*/bash|dash|*/dash|node|*/node|bun|*/bun|env|*/env|python*)
+        case "$t2" in
+          "$CLAUDE_BIN"|*/"${CLAUDE_BIN##*/}") mark_ours "$1"; return 0 ;;
+        esac ;;
+    esac
+  done < <(ps -o args= -p "$pid" 2>/dev/null; ps -o args= --ppid "$pid" 2>/dev/null)
+  return 1
+}
+
+# Leagă gruparea de folderul de pornire al sesiunii, nu de cd-ul din panou.
+same_directory() {
+  local left right
+  left=$(cd -- "$1" 2>/dev/null && pwd -P) || left="$1"
+  right=$(pwd -P)
+  [ "$left" = "$right" ]
+}
+
+group_sessions() {
+  local i scope kind head label
+  local old_L=("${L[@]}") old_A=("${A[@]}") old_N=("${N[@]}") old_D=("${D[@]}") old_S=("${S[@]}") old_T=("${T[@]}")
+  reset_items
+  item "${old_L[0]}" "${old_A[0]}" "${old_N[0]}" "${old_D[0]}" "${old_S[0]}"
+  for scope in local global; do
+    for kind in tmux stopped; do
+      head=
+      for ((i=1; i<${#old_A[@]}; i++)); do
+        [ "${old_A[i]}" = "$kind" ] || continue
+        if same_directory "${old_D[i]}"; then
+          [ "$scope" = local ] || continue
+        else
+          [ "$scope" = global ] || continue
+        fi
+        if [ -z "$head" ]; then
+          if [ "$scope" = local ]; then label="Directorul curent"; else label="Globale (alte directoare)"; fi
+          if [ "$kind" = tmux ]; then label+=" — active"; else label+=" — oprite (Enter = repornește)"; fi
+          item "$label" head; head=1
+        fi
+        item "${old_L[i]}" "$kind" "${old_N[i]}" "${old_D[i]}" "${old_S[i]}" "${old_T[i]}"
+      done
+    done
+  done
+}
+
 convdir() { echo "$PROJECTS/$(echo "$1" | sed 's/[^a-zA-Z0-9]/-/g')"; }
 
 uuid() {
@@ -67,6 +135,16 @@ attach() {
   if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$1"; else tmux attach-session -t "=$1"; fi
 }
 
+# Un panou rămas la shell nu înseamnă că agentul mai rulează.
+agent_stopped() {
+  local command dead
+  dead=$(tmux display-message -p -t "=$1:" '#{pane_dead}' 2>/dev/null </dev/null)
+  [ "$dead" = 1 ] && return 0
+  command=$(tmux display-message -p -t "=$1:" '#{pane_current_command}' 2>/dev/null </dev/null)
+  case "${command##*/}" in bash|sh|dash|zsh|fish|ksh) return 0 ;; esac
+  return 1
+}
+
 launch() {  # nume folder id new|resume
   local name="$1" dir="$2" sid="$3" cmd
   [ -d "$dir" ] || { echo "Folderul '$dir' nu mai există." >&2; return 1; }
@@ -74,7 +152,36 @@ launch() {  # nume folder id new|resume
   else cmd="$CLAUDE_BIN --resume '$sid' || $CLAUDE_BIN --continue"
   fi
   # după ce iese claude, sesiunea rămâne deschisă cu un shell
-  tmux new-session -d -s "$name" -c "$dir" "$cmd; exec \${SHELL:-bash}"
+  if running "$name"; then
+    session_ours "$name" && agent_stopped "$name" || return 1
+    tmux new-window -t "=$name:" -c "$dir" "$cmd; exec \${SHELL:-bash}" || return 1
+  else
+    tmux new-session -d -s "$name" -c "$dir" "$cmd; exec \${SHELL:-bash}" || return 1
+  fi
+  mark_ours "$name"
+}
+
+# Timpul de activitate este cel raportat de tmux (inclusiv output în panou).
+relative_time() {
+  local stamp="$1" now="${TIME_NOW:-$(date +%s)}" elapsed count unit
+  [[ "$stamp" =~ ^[0-9]+$ ]] && [ "$stamp" -gt 0 ] || { printf 'unknown'; return; }
+  elapsed=$((now - stamp))
+  if [ "$elapsed" -lt 60 ]; then printf 'just now'; return; fi
+  if [ "$elapsed" -lt 3600 ]; then count=$((elapsed / 60)); unit=minute
+  elif [ "$elapsed" -lt 86400 ]; then count=$((elapsed / 3600)); unit=hour
+  elif [ "$elapsed" -lt 604800 ]; then count=$((elapsed / 86400)); unit=day
+  elif [ "$elapsed" -lt 2592000 ]; then count=$((elapsed / 604800)); unit=week
+  elif [ "$elapsed" -lt 31536000 ]; then count=$((elapsed / 2592000)); unit=month
+  else count=$((elapsed / 31536000)); unit=year
+  fi
+  [ "$count" -eq 1 ] || unit+=s
+  printf '%s %s ago' "$count" "$unit"
+}
+
+session_times() {
+  local created activity
+  IFS=$'\t' read -r created activity < <(awk -F'\t' -v n="$1" '$1 == n {print $6 "\t" $7; exit}' "$REG")
+  printf 'started %s · active %s' "$(relative_time "$created")" "$(relative_time "$activity")"
 }
 
 # ---------------- istoricul ----------------
@@ -85,12 +192,17 @@ reg_del() {
   awk -F'\t' -v n="$1" '$1 != n && $1 != ""' "$REG" > "$tmp" && mv "$tmp" "$REG"
 }
 reg_set() {  # nume folder id — adaugă sau înlocuiește
+  local created activity
+  created=$(tmux display-message -p -t "=$1:" '#{session_created}' 2>/dev/null </dev/null)
+  activity=$(tmux display-message -p -t "=$1:" '#{session_activity}' 2>/dev/null </dev/null)
   reg_del "$1"
   # "-" = conversație necunoscută (un câmp gol s-ar pierde la citire)
-  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "${3:--}" "$(date '+%Y-%m-%d %H:%M')" >> "$REG"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "${3:--}" "$(date '+%Y-%m-%d %H:%M')" claude "${created:--}" "${activity:--}" >> "$REG"
 }
-reg_touch() {  # nume folder — adaugă doar dacă lipsește (sesiuni pornite manual)
-  [ -n "$(reg_get "$1")" ] || reg_set "$1" "$2" ""
+reg_touch() {  # actualizează timpii, păstrând conversația salvată
+  local sid
+  sid=$(awk -F'\t' -v n="$1" '$1 == n {print $3; exit}' "$REG")
+  reg_set "$1" "$2" "$sid"
 }
 
 # ---------------- acțiuni ----------------
@@ -102,17 +214,19 @@ new_session() {  # folder
   name=$(safe "${name:-$def}")
   if ! running "$name"; then
     sid=$(uuid)
-    launch "$name" "$1" "$sid" new || exit 1
+    launch "$name" "$1" "$sid" new || return 1
     reg_set "$name" "$1" "$sid"
   fi
+  session_ours "$name" || { echo "Sesiunea '$name' aparține altui tool." >&2; return 1; }
   attach "$name"
 }
 
 open_conv() {  # nume folder id — pornește conversația în sesiunea dată și atașează
-  if ! running "$1"; then
-    launch "$1" "$2" "$3" resume || exit 1
+  if ! running "$1" || agent_stopped "$1"; then
+    launch "$1" "$2" "$3" resume || return 1
     reg_set "$1" "$2" "$3"
   fi
+  session_ours "$1" || { echo "Sesiunea '$1' aparține altui tool." >&2; return 1; }
   attach "$1"
 }
 
@@ -120,8 +234,8 @@ open_conv() {  # nume folder id — pornește conversația în sesiunea dată ș
 # L = text, A = tip, N = nume sesiune, D = folder, S = id conversație
 # tipuri: new | tmux | stopped | conv | subnew | subconv | head
 
-item() { L+=("$1"); A+=("$2"); N+=("$3"); D+=("$4"); S+=("$5"); }
-reset_items() { L=(); A=(); N=(); D=(); S=(); }
+item() { L+=("$1"); A+=("$2"); N+=("$3"); D+=("$4"); S+=("$5"); T+=("${6:-}"); }
+reset_items() { L=(); A=(); N=(); D=(); S=(); T=(); }
 
 add_convs() {  # folder tip nume-sesiune ascunde-cele-din-istoric(1/0) titlu
   local dir="$1" kind="$2" name="$3" hide="$4" title="$5" pdir f id lbl k=0 head=
@@ -141,6 +255,7 @@ add_convs() {  # folder tip nume-sesiune ascunde-cele-din-istoric(1/0) titlu
 build_main() {
   reset_items
   local n d s _ path cmd att lbl rec head
+  TIME_NOW=$(date +%s)
   TITLE="Claude Code  $(short "$PWD")"
 
   item "+ Sesiune nouă aici" new "" "$PWD"
@@ -148,6 +263,7 @@ build_main() {
   head=
   while IFS= read -r n; do
     [ -z "$n" ] && continue
+    session_ours "$n" || continue
     [ -z "$head" ] && { item "Sesiuni tmux" head; head=1; }
     path=$(tmux display-message -p -t "=$n:" '#{session_path}' 2>/dev/null </dev/null)
     cmd=$(tmux display-message -p -t "=$n:" '#{pane_current_command}' 2>/dev/null </dev/null)
@@ -159,21 +275,27 @@ build_main() {
     elif [[ "$cmd" == claude* || "$cmd" == node* ]]; then lbl+="   · claude"
     fi
     [ "${att:-0}" -gt 0 ] && lbl+="   ●"
-    item "$lbl" tmux "$n" "$path" "$s"
+    if agent_stopped "$n"; then
+      item "$lbl" stopped "$n" "$path" "$s" "$(session_times "$n")"
+    else
+      item "$lbl" tmux "$n" "$path" "$s" "$(session_times "$n")"
+    fi
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 
   head=
   while IFS=$'\t' read -r n d s _; do
     { [ -z "$n" ] || running "$n"; } && continue
+    legacy_ours "$n" || continue
     [ "$s" = - ] && s=
     [ -z "$head" ] && { item "Oprite (Enter = repornește)" head; head=1; }
     lbl="$n   $(short "$d")"
     if [ -n "$s" ]; then rec=$(preview "$(convdir "$d")/$s.jsonl"); lbl+="   · ${rec:-conversație salvată}"
     else lbl+="   · alegi conversația →"
     fi
-    item "$lbl" stopped "$n" "$d" "$s"
+    item "$lbl" stopped "$n" "$d" "$s" "$(session_times "$n")"
   done < "$REG"
 
+  group_sessions
   add_convs "$PWD" conv "" 1 "Conversații în acest folder"
 }
 
@@ -205,6 +327,9 @@ draw() {
       out "$(printf '\e[36;1m ❯ %s\e[0m' "$t")"
     else
       out "   $t"
+    fi
+    if [ -n "${T[$i]}" ]; then
+      out "$(printf '   \e[2m%s\e[0m' "${T[$i]:0:$w}")"
     fi
   done
   out ""
@@ -248,9 +373,9 @@ sub_menu() {  # nume folder
   while menu; do
     [ "$KEY_ACT" = enter ] || continue
     case "${A[$CUR]}" in
-      subnew)  sid=$(uuid); launch "$1" "$2" "$sid" new || exit 1
-               reg_set "$1" "$2" "$sid"; attach "$1"; exit ;;
-      subconv) open_conv "$1" "$2" "${S[$CUR]}"; exit ;;
+      subnew)  sid=$(uuid); launch "$1" "$2" "$sid" new || return 1
+               reg_set "$1" "$2" "$sid"; attach "$1" && exit ;;
+      subconv) open_conv "$1" "$2" "${S[$CUR]}" && exit ;;
     esac
   done
   return 1   # înapoi la meniul principal
@@ -277,11 +402,11 @@ main() {
     fi
 
     case "${A[$i]}" in
-      new)     new_session "$PWD"; exit ;;
-      tmux)    attach "${N[$i]}"; exit ;;
-      conv)    open_conv "$(safe "cc-$(basename "$PWD")-${S[$i]:0:8}")" "$PWD" "${S[$i]}"; exit ;;
+      new)     new_session "$PWD" && exit ;;
+      tmux)    attach "${N[$i]}" && exit ;;
+      conv)    open_conv "$(safe "cc-$(basename "$PWD")-${S[$i]:0:8}")" "$PWD" "${S[$i]}" && exit ;;
       stopped)
-        if [ -n "${S[$i]}" ]; then open_conv "${N[$i]}" "${D[$i]}" "${S[$i]}"; exit; fi
+        if [ -n "${S[$i]}" ]; then open_conv "${N[$i]}" "${D[$i]}" "${S[$i]}" && exit; continue; fi
         sub_menu "${N[$i]}" "${D[$i]}"
         CUR=0 ;;
     esac
